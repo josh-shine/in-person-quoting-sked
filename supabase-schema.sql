@@ -43,6 +43,20 @@ do $$ begin
   end if;
 end $$;
 
+-- Signed-in admins and users should see the same shared bookings as anon.
+-- The anon policy above already makes this data public; this policy prevents
+-- RLS from filtering every row after a user signs in.
+do $$ begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'quote_appointments'
+      and policyname = 'Authenticated access to booked quote calls'
+  ) then
+    create policy "Authenticated access to booked quote calls"
+    on public.quote_appointments for all to authenticated using (true) with check (true);
+  end if;
+end $$;
+
 create table if not exists public.quote_settings (
   id boolean primary key default true check (id),
   slot_minutes integer not null default 20 check (slot_minutes in (20, 30, 60)),

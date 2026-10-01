@@ -78,3 +78,74 @@ do $$ begin
     end if;
   end if;
 end $$;
+
+-- Email-based app roles. Booking rows stay shared with anon as requested.
+-- Keep the owner email in this private table, not in the public app source.
+create table if not exists public.app_access_config (
+  id boolean primary key default true check (id),
+  owner_email text not null check (owner_email = lower(owner_email)),
+  updated_at timestamptz not null default now()
+);
+alter table public.app_access_config enable row level security;
+revoke all on public.app_access_config from anon, authenticated, public;
+
+-- Only the owner account can assign or change roles. Other signed-in users
+-- default to the User role unless an Admin role is assigned here.
+create table if not exists public.app_user_roles (
+  email text primary key check (email = lower(email)),
+  role text not null default 'user' check (role in ('admin', 'user')),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.app_user_roles enable row level security;
+revoke all on public.app_user_roles from anon, public;
+grant select, insert, update, delete on public.app_user_roles to authenticated;
+
+create or replace function public.is_quote_app_owner()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select lower(coalesce(auth.jwt() ->> 'email', '')) = (
+    select owner_email from public.app_access_config where id = true
+  );
+$$;
+
+create or replace function public.get_quote_app_role()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select case
+    when public.is_quote_app_owner() then 'owner'
+    else coalesce((
+      select role from public.app_user_roles
+      where email = lower(coalesce(auth.jwt() ->> 'email', ''))
+    ), 'user')
+  end;
+$$;
+
+revoke all on function public.is_quote_app_owner() from public, anon;
+grant execute on function public.is_quote_app_owner() to authenticated;
+revoke all on function public.get_quote_app_role() from public, anon;
+grant execute on function public.get_quote_app_role() to authenticated;
+
+drop policy if exists "Users can read own app role" on public.app_user_roles;
+create policy "Users can read own app role"
+on public.app_user_roles for select to authenticated
+using (email = lower(coalesce(auth.jwt() ->> 'email', '')));
+
+drop policy if exists "Owner can manage app roles" on public.app_user_roles;
+create policy "Owner can manage app roles"
+on public.app_user_roles for all to authenticated
+using (public.is_quote_app_owner())
+with check (public.is_quote_app_owner());
+
+insert into public.app_user_roles (email, role)
+select owner_email, 'admin' from public.app_access_config where id = true
+on conflict (email) do update
+set role = 'admin', updated_at = now();

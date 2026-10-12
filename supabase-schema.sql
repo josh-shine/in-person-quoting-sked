@@ -163,3 +163,49 @@ insert into public.app_user_roles (email, role)
 select owner_email, 'admin' from public.app_access_config where id = true
 on conflict (email) do update
 set role = 'admin', updated_at = now();
+
+-- Self-heal the public booking access the app intentionally uses. If a future
+-- dashboard change or migration removes a grant or RLS policy, this scheduled
+-- check restores it within one minute. The app does not require user accounts.
+create or replace function public.ensure_quote_public_access()
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $function$
+begin
+  execute 'grant usage on schema public to anon';
+  execute 'grant select, insert, update, delete on table public.quote_appointments to anon';
+  execute 'grant select, insert, update, delete on table public.quote_settings to anon';
+
+  if not exists (
+    select 1 from pg_catalog.pg_policies
+    where schemaname = 'public' and tablename = 'quote_appointments'
+      and policyname = 'Public no-login access to booked quote calls'
+  ) then
+    execute 'create policy "Public no-login access to booked quote calls" on public.quote_appointments for all to anon using (true) with check (true)';
+  end if;
+
+  if not exists (
+    select 1 from pg_catalog.pg_policies
+    where schemaname = 'public' and tablename = 'quote_settings'
+      and policyname = 'Public no-login access to quote settings'
+  ) then
+    execute 'create policy "Public no-login access to quote settings" on public.quote_settings for all to anon using (true) with check (true)';
+  end if;
+end;
+$function$;
+
+revoke all on function public.ensure_quote_public_access() from public, anon, authenticated;
+
+do $schedule$
+begin
+  if not exists (select 1 from cron.job where jobname = 'quote-public-access-repair') then
+    perform cron.schedule(
+      'quote-public-access-repair',
+      '* * * * *',
+      'select public.ensure_quote_public_access();'
+    );
+  end if;
+end;
+$schedule$;

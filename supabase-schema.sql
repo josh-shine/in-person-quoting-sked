@@ -30,22 +30,11 @@ on public.quote_appointments (location, appointment_date, appointment_time)
 where appointment_time is not null;
 
 alter table public.quote_appointments enable row level security;
-grant select, insert, update, delete on public.quote_appointments to anon, authenticated;
+revoke all on public.quote_appointments from anon;
+grant select, insert, update, delete on public.quote_appointments to authenticated, service_role;
+drop policy if exists "Public no-login access to booked quote calls" on public.quote_appointments;
 
-do $$ begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'public' and tablename = 'quote_appointments'
-      and policyname = 'Public no-login access to booked quote calls'
-  ) then
-    create policy "Public no-login access to booked quote calls"
-    on public.quote_appointments for all to anon using (true) with check (true);
-  end if;
-end $$;
-
--- Signed-in admins and users should see the same shared bookings as anon.
--- The anon policy above already makes this data public; this policy prevents
--- RLS from filtering every row after a user signs in.
+-- Signed-in users and the protected Netlify server function can manage bookings.
 do $$ begin
   if not exists (
     select 1 from pg_policies
@@ -70,17 +59,9 @@ alter table public.quote_settings add column if not exists workday_end time not 
 insert into public.quote_settings (id) values (true) on conflict (id) do nothing;
 
 alter table public.quote_settings enable row level security;
-grant select, insert, update, delete on public.quote_settings to anon, authenticated;
-do $$ begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'public' and tablename = 'quote_settings'
-      and policyname = 'Public no-login access to quote settings'
-  ) then
-    create policy "Public no-login access to quote settings"
-    on public.quote_settings for all to anon using (true) with check (true);
-  end if;
-end $$;
+revoke all on public.quote_settings from anon;
+grant select, insert, update, delete on public.quote_settings to authenticated, service_role;
+drop policy if exists "Public no-login access to quote settings" on public.quote_settings;
 
 do $$ begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
@@ -93,7 +74,7 @@ do $$ begin
   end if;
 end $$;
 
--- Email-based app roles. Booking rows stay shared with anon as requested.
+-- Email-based app roles for any future signed-in administration screens.
 -- Keep the owner email in this private table, not in the public app source.
 create table if not exists public.app_access_config (
   id boolean primary key default true check (id),
@@ -164,48 +145,13 @@ select owner_email, 'admin' from public.app_access_config where id = true
 on conflict (email) do update
 set role = 'admin', updated_at = now();
 
--- Self-heal the public booking access the app intentionally uses. If a future
--- dashboard change or migration removes a grant or RLS policy, this scheduled
--- check restores it within one minute. The app does not require user accounts.
-create or replace function public.ensure_quote_public_access()
-returns void
-language plpgsql
-security definer
-set search_path = ''
-as $function$
-begin
-  execute 'grant usage on schema public to anon';
-  execute 'grant select, insert, update, delete on table public.quote_appointments to anon';
-  execute 'grant select, insert, update, delete on table public.quote_settings to anon';
-
-  if not exists (
-    select 1 from pg_catalog.pg_policies
-    where schemaname = 'public' and tablename = 'quote_appointments'
-      and policyname = 'Public no-login access to booked quote calls'
-  ) then
-    execute 'create policy "Public no-login access to booked quote calls" on public.quote_appointments for all to anon using (true) with check (true)';
-  end if;
-
-  if not exists (
-    select 1 from pg_catalog.pg_policies
-    where schemaname = 'public' and tablename = 'quote_settings'
-      and policyname = 'Public no-login access to quote settings'
-  ) then
-    execute 'create policy "Public no-login access to quote settings" on public.quote_settings for all to anon using (true) with check (true)';
-  end if;
-end;
-$function$;
-
-revoke all on function public.ensure_quote_public_access() from public, anon, authenticated;
-
+-- Remove the former anonymous-access repair job if this script is reapplied.
 do $schedule$
 begin
-  if not exists (select 1 from cron.job where jobname = 'quote-public-access-repair') then
-    perform cron.schedule(
-      'quote-public-access-repair',
-      '* * * * *',
-      'select public.ensure_quote_public_access();'
-    );
+  if exists (select 1 from cron.job where jobname = 'quote-public-access-repair') then
+    perform cron.unschedule('quote-public-access-repair');
   end if;
 end;
 $schedule$;
+
+drop function if exists public.ensure_quote_public_access();
